@@ -1,166 +1,198 @@
+import os
+import json
+import torch
+import faiss
+import numpy as np
+from typing import List, Dict, Optional, Tuple
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from korean_utils import KoreanTextProcessor
+
 class RAGSystem:
-    def __init__(self):
-        self.categories = {
-            'basic': ['기초', '입문', '기본'],
-            'intermediate': ['중급', '심화'],
-            'advanced': ['고급', '마스터'],
-            'rehabilitation': ['재활', '치료', '통증'],
-            'anatomy': ['해부학', '근육', '골격'],
-            'special_conditions': ['임산부', '노인', '특수조건']
-        }
-        self.document_categories = {}  # 문서별 카테고리 저장
-        self.category_embeddings = {}  # 카테고리별 임베딩 저장
-
-    def categorize_document(self, content):
-        """문서 내용을 분석하여 카테고리 분류"""
-        categories = []
-        content_text = ' '.join(content) if isinstance(content, list) else content
+    def __init__(self, model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
+        self.embedding_model = SentenceTransformer(model_name)
+        self.korean_processor = KoreanTextProcessor()
+        self.index = None
+        self.documents = []
+        self.document_embeddings = None
         
-        for category, keywords in self.categories.items():
-            if any(keyword in content_text for keyword in keywords):
-                categories.append(category)
+        # LLM 설정
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "beomi/KoAlpaca-Polyglot-12.8B",
+            trust_remote_code=True
+        )
+        self.model = AutoModelForCausalLM.from_pretrained(
+            "beomi/KoAlpaca-Polyglot-12.8B",
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            device_map="auto"
+        )
         
-        return categories if categories else ['general']
-
-    def add_documents(self, documents, batch_size=32, source_info=None):
-        """카테고리 정보를 포함하여 문서 추가"""
-        for i in range(0, len(documents), batch_size):
-            batch = documents[i:i + batch_size]
+    def add_documents(self, documents: List[Dict]):
+        """문서 추가 및 임베딩 생성"""
+        self.documents.extend(documents)
+        
+        # 문서 텍스트 추출 및 전처리
+        texts = [doc.get('content', '') for doc in documents]
+        texts = [self.korean_processor.preprocess_text(text) for text in texts]
+        
+        # 임베딩 생성
+        new_embeddings = self.embedding_model.encode(texts)
+        
+        if self.document_embeddings is None:
+            self.document_embeddings = new_embeddings
+        else:
+            self.document_embeddings = np.vstack([self.document_embeddings, new_embeddings])
             
-            # 각 문서의 카테고리 분류
-            for doc in batch:
-                categories = self.categorize_document(doc)
-                doc_id = len(self.documents)
-                self.document_categories[doc_id] = categories
-                
-            # 기존의 문서 처리 로직
-            embeddings = self.get_embeddings(batch)
-            self.index.add(embeddings)
-            self.documents.extend(batch)
-            
-            if source_info:
-                self.document_sources.extend([source_info] * len(batch))
-            
-            # 메모리 정리
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    def search_documents(self, query, context=None, top_k=5):
-        """컨텍스트와 카테고리를 고려한 문서 검색"""
-        query_embedding = self.get_embeddings([query])[0]
+        # FAISS 인덱스 업데이트
+        self._update_index()
         
-        # 컨텍스트 기반 카테고리 우선순위 설정
-        priority_categories = self._get_priority_categories(context)
+    def _update_index(self):
+        """FAISS 인덱스 업데이트"""
+        dimension = self.document_embeddings.shape[1]
+        self.index = faiss.IndexFlatL2(dimension)
+        self.index.add(self.document_embeddings.astype('float32'))
         
-        # 검색 및 재정렬
-        D, I = self.index.search(query_embedding.reshape(1, -1), top_k * 2)
+    def search(self, query: str, k: int = 5) -> List[Dict]:
+        """쿼리에 대한 관련 문서 검색"""
+        # 쿼리 전처리 및 임베딩
+        query = self.korean_processor.preprocess_text(query)
+        query_embedding = self.embedding_model.encode([query])[0]
         
-        # 카테고리 기반 점수 조정
-        scored_results = []
+        # 유사도 검색
+        D, I = self.index.search(
+            query_embedding.reshape(1, -1).astype('float32'), 
+            k
+        )
+        
+        # 검색 결과 반환
+        results = []
         for idx, (distance, doc_idx) in enumerate(zip(D[0], I[0])):
-            doc_categories = self.document_categories.get(doc_idx, ['general'])
-            category_bonus = sum(2.0 if cat in priority_categories else 1.0 
-                               for cat in doc_categories)
-            
-            scored_results.append({
-                'idx': doc_idx,
-                'distance': distance,
-                'adjusted_score': distance * (1.0 / category_bonus),
-                'categories': doc_categories
-            })
-        
-        # 조정된 점수로 재정렬
-        scored_results.sort(key=lambda x: x['adjusted_score'])
-        
-        # 상위 K개 결과 반환
-        top_results = scored_results[:top_k]
-        return [self.documents[r['idx']] for r in top_results]
+            if doc_idx < len(self.documents):
+                doc = self.documents[doc_idx].copy()
+                doc['score'] = float(1 / (1 + distance))  # 거리를 점수로 변환
+                results.append(doc)
+                
+        return results
+    
+    def generate_response(self, query: str, context: str) -> str:
+        """컨텍스트를 기반으로 응답 생성"""
+        prompt = f"""아래는 필라테스 운동과 관련된 정보입니다:
 
-    def _get_priority_categories(self, context):
-        """컨텍스트 기반 우선순위 카테고리 결정"""
-        if not context:
-            return []
-            
-        priority_categories = []
-        
-        # 경험 수준에 따른 카테고리
-        experience_level = context.get('experience_level', '').lower()
-        if experience_level == 'beginner':
-            priority_categories.extend(['basic', 'rehabilitation'])
-        elif experience_level == 'intermediate':
-            priority_categories.append('intermediate')
-        elif experience_level == 'advanced':
-            priority_categories.append('advanced')
-            
-        # 통증 수준에 따른 카테고리
-        pain_level = context.get('pain_level', '').lower()
-        if pain_level in ['moderate', 'severe']:
-            priority_categories.extend(['rehabilitation', 'anatomy'])
-            
-        # 특수 조건 확인
-        conditions = context.get('special_conditions', [])
-        if conditions:
-            priority_categories.append('special_conditions')
-            
-        return priority_categories
-
-    def generate_response(self, query, context=None):
-        """컨텍스트 기반 개선된 응답 생성"""
-        relevant_docs = self.search_documents(query, context)
-        
-        # 컨텍스트 기반 프롬프트 생성
-        prompt = self._create_context_aware_prompt(query, relevant_docs, context)
-        
-        try:
-            response = self.generate_text(prompt)
-            return self._format_response(response, context)
-        except Exception as e:
-            print(f"Error generating response: {e}")
-            return "죄송합니다. 응답 생성 중 오류가 발생했습니다."
-
-    def _create_context_aware_prompt(self, query, relevant_docs, context):
-        """컨텍스트를 고려한 프롬프트 생성"""
-        context_str = ""
-        if context:
-            if 'experience_level' in context:
-                context_str += f"\n경험 수준: {context['experience_level']}"
-            if 'pain_level' in context:
-                context_str += f"\n통증 수준: {context['pain_level']}"
-            if 'special_conditions' in context:
-                context_str += f"\n특수 조건: {', '.join(context['special_conditions'])}"
-        
-        docs_text = "\n".join(relevant_docs)
-        
-        prompt = f"""
-다음 정보를 바탕으로 질문에 답변해주세요:
-
-사용자 정보:{context_str}
-
-관련 문서 내용:
-{docs_text}
+{context}
 
 질문: {query}
 
-답변 시 다음 사항을 고려해주세요:
-1. 사용자의 경험 수준과 신체 상태
-2. 안전 주의사항
-3. 단계별 진행 방법
-4. 필요한 경우 대체 운동 제시
-"""
-        return prompt
+위 정보를 바탕으로 답변해주세요. 정보가 불충분하다면, 일반적인 필라테스 원칙에 기반하여 답변해주세요.
 
-    def _format_response(self, response, context):
-        """컨텍스트에 맞게 응답 포맷팅"""
-        experience_level = context.get('experience_level', '').lower()
-        pain_level = context.get('pain_level', '').lower()
+답변:"""
         
-        # 경험 수준별 추가 정보
-        if experience_level == 'beginner':
-            response += "\n\n초보자를 위한 추가 팁:\n- 천천히 진행하세요\n- 불편함을 느끼면 즉시 중단하세요"
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        outputs = self.model.generate(
+            **inputs,
+            max_length=512,
+            num_return_sequences=1,
+            temperature=0.7,
+            top_p=0.9,
+            do_sample=True,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id
+        )
         
-        # 통증 수준별 주의사항
-        if pain_level in ['moderate', 'severe']:
-            response += "\n\n주의사항:\n- 통증이 심해지면 즉시 중단하세요\n- 필요한 경우 전문가와 상담하세요"
+        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        response = response.replace(prompt, "").strip()
         
         return response
+    
+    def process_query(self, query: str, k: int = 3) -> str:
+        """쿼리 처리 및 응답 생성"""
+        # 관련 문서 검색
+        relevant_docs = self.search(query, k=k)
+        
+        # 컨텍스트 구성
+        context = "\n\n".join([
+            f"문서 {i+1}:\n{doc.get('content', '')}"
+            for i, doc in enumerate(relevant_docs)
+        ])
+        
+        # 응답 생성
+        response = self.generate_response(query, context)
+        
+        return response
+    
+    def analyze_exercise(self, exercise_text: str) -> Dict:
+        """운동 분석"""
+        # 기본 정보 추출
+        components = self.korean_processor.extract_exercise_components(exercise_text)
+        
+        # 난이도 분석
+        difficulty = self.korean_processor.analyze_difficulty(exercise_text)
+        
+        # 운동 초점 분석
+        focus = self.korean_processor.analyze_exercise_focus(exercise_text)
+        
+        # 키워드 추출
+        keywords = self.korean_processor.extract_keywords(exercise_text)
+        
+        return {
+            'components': components,
+            'difficulty': difficulty,
+            'focus_areas': focus,
+            'keywords': keywords
+        }
+    
+    def generate_exercise_recommendation(self, 
+                                      patient_info: Dict,
+                                      condition: str,
+                                      difficulty_level: str = '기본') -> Dict:
+        """환자 정보에 기반한 운동 추천"""
+        # 검색 쿼리 구성
+        query = f"{condition} {difficulty_level} 운동"
+        relevant_docs = self.search(query, k=5)
+        
+        # 운동 추천 생성
+        recommendations = []
+        for doc in relevant_docs:
+            exercise_analysis = self.analyze_exercise(doc.get('content', ''))
+            
+            # 환자 상태와 운동 난이도 매칭
+            if exercise_analysis['difficulty']['overall_level'] == difficulty_level:
+                recommendations.append({
+                    'exercise': doc.get('content', ''),
+                    'analysis': exercise_analysis,
+                    'score': doc.get('score', 0)
+                })
+        
+        # 점수순 정렬
+        recommendations.sort(key=lambda x: x['score'], reverse=True)
+        
+        return {
+            'patient_info': patient_info,
+            'condition': condition,
+            'difficulty_level': difficulty_level,
+            'recommendations': recommendations[:3]  # 상위 3개 추천
+        }
+    
+    def save_index(self, path: str):
+        """인덱스 및 문서 저장"""
+        if not os.path.exists(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path))
+            
+        # FAISS 인덱스 저장
+        faiss.write_index(self.index, f"{path}.index")
+        
+        # 문서 및 임베딩 저장
+        np.save(f"{path}_embeddings.npy", self.document_embeddings)
+        with open(f"{path}_documents.json", 'w', encoding='utf-8') as f:
+            json.dump(self.documents, f, ensure_ascii=False, indent=2)
+            
+    def load_index(self, path: str):
+        """인덱스 및 문서 로드"""
+        # FAISS 인덱스 로드
+        self.index = faiss.read_index(f"{path}.index")
+        
+        # 문서 및 임베딩 로드
+        self.document_embeddings = np.load(f"{path}_embeddings.npy")
+        with open(f"{path}_documents.json", 'r', encoding='utf-8') as f:
+            self.documents = json.load(f)
