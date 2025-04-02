@@ -1,198 +1,253 @@
-import os
-import json
 import torch
+from typing import List, Dict, Optional, Tuple
+from pathlib import Path
+import json
 import faiss
 import numpy as np
-from typing import List, Dict, Optional, Tuple
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-from korean_utils import KoreanTextProcessor
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import pandas as pd
+from dataclasses import dataclass
+from tqdm import tqdm
 
-class RAGSystem:
-    def __init__(self, model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
-        self.embedding_model = SentenceTransformer(model_name)
-        self.korean_processor = KoreanTextProcessor()
+@dataclass
+class Document:
+    """문서 데이터 클래스"""
+    content: str
+    metadata: Dict
+    embedding: Optional[np.ndarray] = None
+
+class RAGProcessor:
+    def __init__(self, 
+                 model_name: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+                 generator_name: str = "google/flan-t5-large",
+                 device: str = None):
+        """
+        RAG 프로세서 초기화
+        Args:
+            model_name: 임베딩 모델 이름
+            generator_name: 생성 모델 이름
+            device: 사용할 디바이스 (cuda/cpu)
+        """
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 임베딩 모델 초기화
+        self.embedding_model = SentenceTransformer(model_name, device=self.device)
+        
+        # 생성 모델 초기화
+        self.generator_tokenizer = AutoTokenizer.from_pretrained(generator_name)
+        self.generator_model = AutoModelForSeq2SeqLM.from_pretrained(generator_name).to(self.device)
+        
+        # FAISS 인덱스 초기화
         self.index = None
         self.documents = []
-        self.document_embeddings = None
         
-        # LLM 설정
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "beomi/KoAlpaca-Polyglot-12.8B",
-            trust_remote_code=True
-        )
-        self.model = AutoModelForCausalLM.from_pretrained(
-            "beomi/KoAlpaca-Polyglot-12.8B",
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-            device_map="auto"
-        )
+    def add_textbook_content(self, content: Dict[str, str], chunk_size: int = 500):
+        """
+        교재 내용을 청크로 분할하여 추가
+        """
+        for section, text in content.items():
+            chunks = self._split_text(text, chunk_size)
+            for chunk in chunks:
+                doc = Document(
+                    content=chunk,
+                    metadata={"source": "textbook", "section": section}
+                )
+                self.documents.append(doc)
+    
+    def add_medical_paper(self, paper: Dict[str, str]):
+        """
+        의학 논문 추가
+        """
+        # 논문의 주요 섹션별로 처리
+        sections = ["abstract", "introduction", "methods", "results", "discussion", "conclusion"]
+        for section in sections:
+            if section in paper:
+                doc = Document(
+                    content=paper[section],
+                    metadata={
+                        "source": "paper",
+                        "title": paper.get("title", ""),
+                        "authors": paper.get("authors", []),
+                        "year": paper.get("year", ""),
+                        "section": section
+                    }
+                )
+                self.documents.append(doc)
+    
+    def build_index(self):
+        """FAISS 인덱스 구축"""
+        print("임베딩 생성 중...")
+        embeddings = []
+        for doc in tqdm(self.documents):
+            embedding = self.embedding_model.encode(doc.content)
+            doc.embedding = embedding
+            embeddings.append(embedding)
         
-    def add_documents(self, documents: List[Dict]):
-        """문서 추가 및 임베딩 생성"""
-        self.documents.extend(documents)
+        embeddings = np.array(embeddings)
+        dimension = embeddings.shape[1]
         
-        # 문서 텍스트 추출 및 전처리
-        texts = [doc.get('content', '') for doc in documents]
-        texts = [self.korean_processor.preprocess_text(text) for text in texts]
-        
-        # 임베딩 생성
-        new_embeddings = self.embedding_model.encode(texts)
-        
-        if self.document_embeddings is None:
-            self.document_embeddings = new_embeddings
-        else:
-            self.document_embeddings = np.vstack([self.document_embeddings, new_embeddings])
-            
-        # FAISS 인덱스 업데이트
-        self._update_index()
-        
-    def _update_index(self):
-        """FAISS 인덱스 업데이트"""
-        dimension = self.document_embeddings.shape[1]
+        # FAISS 인덱스 생성
         self.index = faiss.IndexFlatL2(dimension)
-        self.index.add(self.document_embeddings.astype('float32'))
+        self.index.add(embeddings)
         
-    def search(self, query: str, k: int = 5) -> List[Dict]:
-        """쿼리에 대한 관련 문서 검색"""
-        # 쿼리 전처리 및 임베딩
-        query = self.korean_processor.preprocess_text(query)
-        query_embedding = self.embedding_model.encode([query])[0]
-        
-        # 유사도 검색
-        D, I = self.index.search(
-            query_embedding.reshape(1, -1).astype('float32'), 
+        print(f"인덱스 구축 완료: {len(self.documents)} 문서")
+    
+    def retrieve(self, query: str, k: int = 5) -> List[Document]:
+        """
+        쿼리와 관련된 문서 검색
+        """
+        query_embedding = self.embedding_model.encode(query)
+        distances, indices = self.index.search(
+            query_embedding.reshape(1, -1),
             k
         )
         
-        # 검색 결과 반환
-        results = []
-        for idx, (distance, doc_idx) in enumerate(zip(D[0], I[0])):
-            if doc_idx < len(self.documents):
-                doc = self.documents[doc_idx].copy()
-                doc['score'] = float(1 / (1 + distance))  # 거리를 점수로 변환
-                results.append(doc)
-                
-        return results
+        return [self.documents[i] for i in indices[0]]
     
-    def generate_response(self, query: str, context: str) -> str:
-        """컨텍스트를 기반으로 응답 생성"""
-        prompt = f"""아래는 필라테스 운동과 관련된 정보입니다:
-
-{context}
-
-질문: {query}
-
-위 정보를 바탕으로 답변해주세요. 정보가 불충분하다면, 일반적인 필라테스 원칙에 기반하여 답변해주세요.
-
-답변:"""
+    def generate_evidence_based_prescription(self, 
+                                          patient_info: str,
+                                          condition: str,
+                                          retrieved_docs: List[Document]) -> Dict[str, str]:
+        """
+        검색된 문서를 기반으로 근거 기반 처방 생성
+        """
+        # 컨텍스트 구성
+        context = self._prepare_context(retrieved_docs)
         
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        outputs = self.model.generate(
+        # 프롬프트 구성
+        prompt = f"""
+        Based on the following patient information and medical evidence, 
+        create a detailed Medical Pilates prescription:
+
+        Patient Information:
+        {patient_info}
+
+        Condition:
+        {condition}
+
+        Medical Evidence and Guidelines:
+        {context}
+
+        Generate a prescription that includes:
+        1. Evidence-based rationale
+        2. Specific exercise recommendations
+        3. Scientific references
+        4. Safety considerations
+        """
+        
+        # 처방 생성
+        inputs = self.generator_tokenizer(prompt, return_tensors="pt", max_length=1024, truncation=True)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        outputs = self.generator_model.generate(
             **inputs,
-            max_length=512,
-            num_return_sequences=1,
+            max_length=1500,
+            num_beams=4,
             temperature=0.7,
-            top_p=0.9,
-            do_sample=True,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id
+            no_repeat_ngram_size=3
         )
         
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        response = response.replace(prompt, "").strip()
+        prescription = self.generator_tokenizer.decode(outputs[0], skip_special_tokens=True)
         
-        return response
-    
-    def process_query(self, query: str, k: int = 3) -> str:
-        """쿼리 처리 및 응답 생성"""
-        # 관련 문서 검색
-        relevant_docs = self.search(query, k=k)
-        
-        # 컨텍스트 구성
-        context = "\n\n".join([
-            f"문서 {i+1}:\n{doc.get('content', '')}"
-            for i, doc in enumerate(relevant_docs)
-        ])
-        
-        # 응답 생성
-        response = self.generate_response(query, context)
-        
-        return response
-    
-    def analyze_exercise(self, exercise_text: str) -> Dict:
-        """운동 분석"""
-        # 기본 정보 추출
-        components = self.korean_processor.extract_exercise_components(exercise_text)
-        
-        # 난이도 분석
-        difficulty = self.korean_processor.analyze_difficulty(exercise_text)
-        
-        # 운동 초점 분석
-        focus = self.korean_processor.analyze_exercise_focus(exercise_text)
-        
-        # 키워드 추출
-        keywords = self.korean_processor.extract_keywords(exercise_text)
+        # 참조 문헌 정보 수집
+        references = self._collect_references(retrieved_docs)
         
         return {
-            'components': components,
-            'difficulty': difficulty,
-            'focus_areas': focus,
-            'keywords': keywords
+            "prescription": prescription,
+            "references": references
         }
     
-    def generate_exercise_recommendation(self, 
-                                      patient_info: Dict,
-                                      condition: str,
-                                      difficulty_level: str = '기본') -> Dict:
-        """환자 정보에 기반한 운동 추천"""
-        # 검색 쿼리 구성
-        query = f"{condition} {difficulty_level} 운동"
-        relevant_docs = self.search(query, k=5)
+    def _split_text(self, text: str, chunk_size: int) -> List[str]:
+        """텍스트를 청크로 분할"""
+        words = text.split()
+        chunks = []
+        current_chunk = []
+        current_size = 0
         
-        # 운동 추천 생성
-        recommendations = []
-        for doc in relevant_docs:
-            exercise_analysis = self.analyze_exercise(doc.get('content', ''))
+        for word in words:
+            current_chunk.append(word)
+            current_size += len(word) + 1
             
-            # 환자 상태와 운동 난이도 매칭
-            if exercise_analysis['difficulty']['overall_level'] == difficulty_level:
-                recommendations.append({
-                    'exercise': doc.get('content', ''),
-                    'analysis': exercise_analysis,
-                    'score': doc.get('score', 0)
-                })
+            if current_size >= chunk_size:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = []
+                current_size = 0
         
-        # 점수순 정렬
-        recommendations.sort(key=lambda x: x['score'], reverse=True)
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
         
-        return {
-            'patient_info': patient_info,
-            'condition': condition,
-            'difficulty_level': difficulty_level,
-            'recommendations': recommendations[:3]  # 상위 3개 추천
-        }
+        return chunks
+    
+    def _prepare_context(self, documents: List[Document]) -> str:
+        """검색된 문서들을 컨텍스트로 구성"""
+        context_parts = []
+        
+        for doc in documents:
+            if doc.metadata["source"] == "textbook":
+                context_parts.append(f"Textbook ({doc.metadata['section']}):\n{doc.content}")
+            else:  # paper
+                context_parts.append(
+                    f"Research Paper ({doc.metadata['year']}, {doc.metadata['section']}):\n{doc.content}"
+                )
+        
+        return "\n\n".join(context_parts)
+    
+    def _collect_references(self, documents: List[Document]) -> List[Dict]:
+        """참조 문헌 정보 수집"""
+        references = []
+        
+        for doc in documents:
+            if doc.metadata["source"] == "paper":
+                ref = {
+                    "title": doc.metadata["title"],
+                    "authors": doc.metadata["authors"],
+                    "year": doc.metadata["year"],
+                    "section": doc.metadata["section"]
+                }
+                if ref not in references:
+                    references.append(ref)
+        
+        return references
     
     def save_index(self, path: str):
         """인덱스 및 문서 저장"""
-        if not os.path.exists(os.path.dirname(path)):
-            os.makedirs(os.path.dirname(path))
-            
-        # FAISS 인덱스 저장
-        faiss.write_index(self.index, f"{path}.index")
+        save_dir = Path(path)
+        save_dir.mkdir(parents=True, exist_ok=True)
         
-        # 문서 및 임베딩 저장
-        np.save(f"{path}_embeddings.npy", self.document_embeddings)
-        with open(f"{path}_documents.json", 'w', encoding='utf-8') as f:
-            json.dump(self.documents, f, ensure_ascii=False, indent=2)
-            
+        # FAISS 인덱스 저장
+        faiss.write_index(self.index, str(save_dir / "index.faiss"))
+        
+        # 문서 데이터 저장
+        docs_data = []
+        for doc in self.documents:
+            doc_dict = {
+                "content": doc.content,
+                "metadata": doc.metadata,
+                "embedding": doc.embedding.tolist() if doc.embedding is not None else None
+            }
+            docs_data.append(doc_dict)
+        
+        with open(save_dir / "documents.json", "w", encoding="utf-8") as f:
+            json.dump(docs_data, f, ensure_ascii=False, indent=2)
+    
     def load_index(self, path: str):
         """인덱스 및 문서 로드"""
-        # FAISS 인덱스 로드
-        self.index = faiss.read_index(f"{path}.index")
+        load_dir = Path(path)
         
-        # 문서 및 임베딩 로드
-        self.document_embeddings = np.load(f"{path}_embeddings.npy")
-        with open(f"{path}_documents.json", 'r', encoding='utf-8') as f:
-            self.documents = json.load(f)
+        # FAISS 인덱스 로드
+        self.index = faiss.read_index(str(load_dir / "index.faiss"))
+        
+        # 문서 데이터 로드
+        with open(load_dir / "documents.json", "r", encoding="utf-8") as f:
+            docs_data = json.load(f)
+        
+        self.documents = []
+        for doc_dict in docs_data:
+            doc = Document(
+                content=doc_dict["content"],
+                metadata=doc_dict["metadata"]
+            )
+            if doc_dict["embedding"] is not None:
+                doc.embedding = np.array(doc_dict["embedding"])
+            self.documents.append(doc)
