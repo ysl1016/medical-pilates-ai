@@ -39,6 +39,10 @@ class DocumentParser:
         
         parsed_documents = []
         
+        if not input_path.exists():
+            self.logger.error(f"입력 디렉토리가 존재하지 않습니다: {input_path}")
+            return []
+        
         for file_path in input_path.rglob("*"):
             if not file_path.is_file():
                 continue
@@ -51,6 +55,7 @@ class DocumentParser:
                 elif file_path.suffix.lower() in ['.docx', '.doc']:
                     doc_data = self.parse_docx(file_path)
                 else:
+                    self.logger.debug(f"지원하지 않는 파일 형식: {file_path.name}")
                     continue
                 
                 if doc_data:
@@ -68,15 +73,19 @@ class DocumentParser:
                         json.dump(doc_data, f, ensure_ascii=False, indent=2)
                     
                     parsed_documents.append(doc_data)
-                    self.logger.info(f"Successfully parsed and saved: {file_path.name}")
+                    self.logger.info(f"파싱 및 저장 완료: {file_path.name}")
                     
             except Exception as e:
-                self.logger.error(f"Error parsing {file_path.name}: {str(e)}")
+                self.logger.error(f"파일 파싱 중 오류 발생 ({file_path.name}): {str(e)}", exc_info=True)
                 
         return parsed_documents
 
     def parse_pdf(self, file_path: Path) -> Optional[Dict]:
-        """PDF 파일 파싱"""
+        """PDF 파일 파싱 - 예외 처리 개선"""
+        if not file_path.exists():
+            self.logger.error(f"PDF 파일을 찾을 수 없습니다: {file_path}")
+            return None
+            
         try:
             doc = fitz.open(file_path)
             content = ""
@@ -129,12 +138,25 @@ class DocumentParser:
                 "content": "\n".join(section["content"] for section in sections)
             }
             
+        except FileNotFoundError:
+            self.logger.error(f"PDF 파일을 찾을 수 없습니다: {file_path}")
+            return None
+        except fitz.FileDataError:
+            self.logger.error(f"잘못된 PDF 형식입니다: {file_path}")
+            return None
+        except PermissionError:
+            self.logger.error(f"PDF 파일 접근 권한이 없습니다: {file_path}")
+            return None
         except Exception as e:
-            self.logger.error(f"PDF parsing error for {file_path.name}: {str(e)}")
+            self.logger.error(f"PDF 파싱 오류 ({file_path.name}): {str(e)}", exc_info=True)
             return None
 
     def parse_markdown(self, file_path: Path) -> Optional[Dict]:
-        """Markdown 파일 파싱"""
+        """Markdown 파일 파싱 - 예외 처리 개선"""
+        if not file_path.exists():
+            self.logger.error(f"Markdown 파일을 찾을 수 없습니다: {file_path}")
+            return None
+            
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 md_content = f.read()
@@ -171,12 +193,25 @@ class DocumentParser:
                 "content": "\n".join(section["content"] for section in sections)
             }
             
+        except FileNotFoundError:
+            self.logger.error(f"Markdown 파일을 찾을 수 없습니다: {file_path}")
+            return None
+        except UnicodeDecodeError:
+            self.logger.error(f"Markdown 파일 인코딩 오류: {file_path}")
+            return None
+        except PermissionError:
+            self.logger.error(f"Markdown 파일 접근 권한이 없습니다: {file_path}")
+            return None
         except Exception as e:
-            self.logger.error(f"Markdown parsing error for {file_path.name}: {str(e)}")
+            self.logger.error(f"Markdown 파싱 오류 ({file_path.name}): {str(e)}", exc_info=True)
             return None
 
     def parse_docx(self, file_path: Path) -> Optional[Dict]:
-        """DOCX 파일 파싱"""
+        """DOCX 파일 파싱 - 예외 처리 개선"""
+        if not file_path.exists():
+            self.logger.error(f"DOCX 파일을 찾을 수 없습니다: {file_path}")
+            return None
+            
         try:
             doc = Document(file_path)
             sections = []
@@ -208,19 +243,59 @@ class DocumentParser:
                 "content": "\n".join(section["content"] for section in sections)
             }
             
+        except FileNotFoundError:
+            self.logger.error(f"DOCX 파일을 찾을 수 없습니다: {file_path}")
+            return None
+        except PermissionError:
+            self.logger.error(f"DOCX 파일 접근 권한이 없습니다: {file_path}")
+            return None
         except Exception as e:
-            self.logger.error(f"DOCX parsing error for {file_path.name}: {str(e)}")
+            self.logger.error(f"DOCX 파싱 오류 ({file_path.name}): {str(e)}", exc_info=True)
             return None
 
     def detect_language(self, text: str) -> str:
-        """텍스트 언어 감지"""
+        """텍스트 언어 감지 - 에러 처리 개선"""
+        if not text or len(text.strip()) < 10:
+            return "unknown"
+            
         try:
-            return detect(text[:1000])  # 첫 1000자만 사용하여 언어 감지
-        except:
+            # 더 많은 텍스트 샘플링으로 정확도 향상
+            sample_size = min(2000, len(text))
+            # 텍스트의 다른 부분에서 샘플링
+            samples = [
+                text[:sample_size//2],
+                text[len(text)//2:len(text)//2 + sample_size//2]
+            ]
+            
+            # 샘플별 언어 감지 후 다수결로 결정
+            lang_votes = {}
+            for sample in samples:
+                if sample.strip():
+                    lang = detect(sample)
+                    lang_votes[lang] = lang_votes.get(lang, 0) + 1
+            
+            if lang_votes:
+                # 가장 많은 투표를 받은 언어 반환
+                return max(lang_votes.items(), key=lambda x: x[1])[0]
+            return "unknown"
+            
+        except Exception as e:
+            self.logger.warning(f"언어 감지 중 오류 발생: {str(e)}")
             return "unknown"
 
     def extract_exercise_info(self, content: str) -> Dict:
-        """운동 관련 정보 추출"""
+        """운동 관련 정보 추출 - 에러 처리 개선"""
+        if not content or not content.strip():
+            return {
+                "name": None,
+                "equipment": [],
+                "difficulty": None,
+                "target_muscles": [],
+                "contraindications": [],
+                "modifications": [],
+                "instructions": []
+            }
+            
         exercise_info = {
             "name": None,
             "equipment": [],
@@ -243,22 +318,32 @@ class DocumentParser:
         }
         
         for key, pattern in patterns.items():
-            match = re.search(pattern, content, re.IGNORECASE | re.MULTILINE)
-            if match:
-                value = match.group(1).strip()
-                if key in ["equipment", "target_muscles", "contraindications", "modifications"]:
-                    exercise_info[key] = [item.strip() for item in value.split(',')]
-                else:
-                    exercise_info[key] = value
+            try:
+                match = re.search(pattern, content, re.IGNORECASE | re.MULTILINE)
+                if match:
+                    value = match.group(1).strip()
+                    if key in ["equipment", "target_muscles", "contraindications", "modifications"]:
+                        exercise_info[key] = [item.strip() for item in value.split(',')]
+                    else:
+                        exercise_info[key] = value
+            except Exception as e:
+                self.logger.warning(f"'{key}' 정보 추출 중 오류 발생: {str(e)}")
         
         return exercise_info
 
     def process_medical_papers(self, papers_data: List[Dict]) -> List[Dict]:
-        """의학 논문 데이터 처리"""
+        """의학 논문 데이터 처리 - 에러 처리 개선"""
+        if not papers_data:
+            return []
+            
         processed_papers = []
         
         for paper in papers_data:
             try:
+                if not isinstance(paper, dict):
+                    self.logger.warning(f"잘못된 논문 데이터 형식: {type(paper)}")
+                    continue
+                    
                 # 논문 메타데이터 추출
                 metadata = {
                     "title": paper.get("title", ""),
@@ -287,6 +372,29 @@ class DocumentParser:
                 processed_papers.append(processed_paper)
                 
             except Exception as e:
-                self.logger.error(f"Error processing paper {paper.get('title', 'Unknown')}: {str(e)}")
+                paper_title = paper.get('title', 'Unknown') if isinstance(paper, dict) else 'Invalid paper'
+                self.logger.error(f"논문 처리 중 오류 발생 ({paper_title}): {str(e)}", exc_info=True)
         
         return processed_papers
+        
+    def parse_file(self, file_path: str) -> Optional[Dict]:
+        """단일 파일 파싱 (추가된 편의 메서드)"""
+        path = Path(file_path)
+        
+        if not path.exists():
+            self.logger.error(f"파일을 찾을 수 없습니다: {path}")
+            return None
+            
+        try:
+            if path.suffix.lower() == '.pdf':
+                return self.parse_pdf(path)
+            elif path.suffix.lower() == '.md':
+                return self.parse_markdown(path)
+            elif path.suffix.lower() in ['.docx', '.doc']:
+                return self.parse_docx(path)
+            else:
+                self.logger.warning(f"지원하지 않는 파일 형식: {path.suffix}")
+                return None
+        except Exception as e:
+            self.logger.error(f"파일 파싱 중 오류 발생 ({path.name}): {str(e)}", exc_info=True)
+            return None
