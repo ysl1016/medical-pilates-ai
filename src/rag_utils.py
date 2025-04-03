@@ -9,6 +9,7 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import pandas as pd
 from dataclasses import dataclass
 from tqdm import tqdm
+from korean_utils import KoreanTextProcessor
 
 @dataclass
 class Document:
@@ -251,3 +252,54 @@ class RAGProcessor:
             if doc_dict["embedding"] is not None:
                 doc.embedding = np.array(doc_dict["embedding"])
             self.documents.append(doc)
+
+class RAGSystem:
+    """RAG 기반 질의응답 시스템"""
+    
+    def __init__(self, processor=None, model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2"):
+        """RAG 시스템 초기화"""
+        self.processor = processor or RAGProcessor(model_name=model_name)
+        self.korean_processor = KoreanTextProcessor()
+    
+    def add_knowledge_base(self, textbooks=None, papers=None, exercises=None):
+        """지식 베이스 추가"""
+        if textbooks:
+            for textbook in textbooks:
+                self.processor.add_textbook_content(textbook)
+                
+        if papers:
+            for paper in papers:
+                self.processor.add_medical_paper(paper)
+        
+        # 인덱스 구축
+        self.processor.build_index()
+    
+    def generate_response(self, query, context=None):
+        """사용자 질의에 대한 응답 생성"""
+        # 한국어 질의 처리
+        query_ko = query
+        query_en = self.korean_processor.translate_ko_to_en(query)
+        
+        # 컨텍스트 정보 준비
+        if context:
+            patient_info = f"""
+            통증 수준: {context.get('pain_level', 0)}/10
+            경험 수준: {context.get('experience_level', '초보자')}
+            """
+        else:
+            patient_info = "일반적인 건강 상태"
+            
+        # 관련 문서 검색
+        retrieved_docs = self.processor.retrieve(query_en, k=5)
+        
+        # 응답 생성
+        result = self.processor.generate_evidence_based_prescription(
+            patient_info=patient_info,
+            condition=query_en,
+            retrieved_docs=retrieved_docs
+        )
+        
+        # 한국어 응답 변환
+        response_ko = self.korean_processor.translate_en_to_ko(result['prescription'])
+        
+        return response_ko
